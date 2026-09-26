@@ -46,7 +46,7 @@ APP_TITLE = "Image Background Tool"
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {
-	".avif",
+        ".avif",
         ".jpg",
         ".jpeg",
         ".png",
@@ -84,6 +84,46 @@ def ratio_value(ratio: str) -> float:
     width, height = ratio.split(":")
 
     return int(width) / int(height)
+
+
+def pad_image(
+    image: Image.Image,
+    padding: int,
+    background: RGBColor,
+) -> Image.Image:
+    """
+    Add equal padding around all four sides of the image.
+
+    The padding is filled with the selected background color.
+    """
+    source: Image.Image = ImageOps.exif_transpose(
+        image
+    ).convert("RGBA")
+
+    padding = max(0, int(padding))
+
+    if padding == 0:
+        return source.copy()
+
+    width: int
+    height: int
+    width, height = source.size
+
+    canvas: Image.Image = Image.new(
+        "RGBA",
+        (
+            width + padding * 2,
+            height + padding * 2,
+        ),
+        (*background, 255),
+    )
+
+    canvas.alpha_composite(
+        source,
+        (padding, padding),
+    )
+
+    return canvas
 
 
 def crop_image(
@@ -327,12 +367,20 @@ def make_preview(
     tile_size: tuple[int, int],
     crop_ratio: CropRatio,
     size_mode: SizeMode,
+    padding: int = 0,
 ) -> Image.Image:
     """
     Create the thumbnail preview.
 
-    Crop is applied first, then Fit/Fill is applied to the screen-aspect
-    preview area.
+    Processing order:
+
+        original image
+             ↓
+        crop
+             ↓
+        padding
+             ↓
+        Fit/Fill into screen-aspect preview area
     """
     tile_width: int
     tile_height: int
@@ -349,6 +397,12 @@ def make_preview(
         crop_ratio,
     )
 
+    padded: Image.Image = pad_image(
+        cropped,
+        padding,
+        background,
+    )
+
     available_width: int = max(
         1,
         tile_width - PREVIEW_MARGIN * 2,
@@ -361,7 +415,7 @@ def make_preview(
 
     if size_mode == "fill":
         fitted: Image.Image = apply_size_mode(
-            cropped,
+            padded,
             (
                 available_width,
                 available_height,
@@ -380,7 +434,7 @@ def make_preview(
         return canvas
 
     fitted = apply_size_mode(
-        cropped,
+        padded,
         (
             available_width,
             available_height,
@@ -410,6 +464,7 @@ def make_output_image(
     aspect_ratio: float,
     crop_ratio: CropRatio,
     size_mode: SizeMode,
+    padding: int = 0,
 ) -> Image.Image:
     """
     Create the final saved image.
@@ -422,6 +477,8 @@ def make_output_image(
              ↓
         crop
              ↓
+        padding
+             ↓
         fit/fill into screen-aspect canvas
              ↓
         background where required
@@ -431,14 +488,20 @@ def make_output_image(
         crop_ratio,
     )
 
+    padded: Image.Image = pad_image(
+        cropped,
+        padding,
+        background,
+    )
+
     source_width: int
     source_height: int
 
     source_width, source_height = (
-        cropped.size
+        padded.size
     )
 
-    # For FIT, preserve the original cropped pixel dimensions and expand
+    # For FIT, preserve the original padded pixel dimensions and expand
     # the canvas to the requested aspect ratio.
     if size_mode == "fit":
         canvas_width: int = source_width
@@ -475,7 +538,7 @@ def make_output_image(
         ) // 2
 
         canvas.alpha_composite(
-            cropped,
+            padded,
             (x, y),
         )
 
@@ -503,7 +566,7 @@ def make_output_image(
         )
 
     filled: Image.Image = ImageOps.fit(
-        cropped,
+        padded,
         (
             canvas_width,
             canvas_height,
@@ -595,6 +658,7 @@ class ImageItem:
         # Persistent editing state.
         self.crop_ratio: CropRatio = None
         self.size_mode: SizeMode = "fit"
+        self.padding: int = 0
 
         # GTK widgets.
         self.button: Gtk.Button | None = None
@@ -651,6 +715,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.pending_crop_ratio: CropRatio = None
         self.pending_size_mode: SizeMode = "fit"
+        self.pending_padding: int = 0
 
         self.build_ui()
         self.apply_css()
@@ -738,6 +803,17 @@ class MainWindow(Gtk.ApplicationWindow):
             self.on_crop_clicked,
         )
 
+        self.pad_button: Gtk.Button = (
+            Gtk.Button(
+                label="Pad",
+            )
+        )
+
+        self.pad_button.connect(
+            "clicked",
+            self.on_pad_clicked,
+        )
+
         self.size_button: Gtk.Button = (
             Gtk.Button(
                 label="Size",
@@ -777,11 +853,15 @@ class MainWindow(Gtk.ApplicationWindow):
         )
 
         self.selection_bar.append(
+            self.pad_button
+        )
+
+        self.selection_bar.append(
             self.size_button
         )
 
         self.selection_bar.append(
-            self.clear_selection_button
+            self.clear_selection_button,
         )
 
         # --------------------------------------------------------------------
@@ -853,6 +933,100 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.crop_controls.append(
             self.crop_save_button
+        )
+
+        # --------------------------------------------------------------------
+        # Pad controls
+        # --------------------------------------------------------------------
+
+        self.pad_controls: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+        )
+
+        self.pad_label: Gtk.Label = Gtk.Label(
+            label="Pad image",
+        )
+
+        self.pad_controls.append(
+            self.pad_label
+        )
+
+        self.pad_entry: Gtk.SpinButton = (
+            Gtk.SpinButton()
+        )
+
+        self.pad_entry.set_range(
+            0,
+            10000,
+        )
+
+        self.pad_entry.set_increments(
+            1,
+            10,
+        )
+
+        self.pad_entry.set_numeric(
+            True
+        )
+
+        self.pad_entry.set_value(
+            0
+        )
+
+        self.pad_entry.set_width_chars(
+            6
+        )
+
+        self.pad_entry.connect(
+            "value-changed",
+            self.on_pad_value_changed,
+        )
+
+        self.pad_controls.append(
+            self.pad_entry
+        )
+
+        self.pad_px_label: Gtk.Label = Gtk.Label(
+            label="px",
+        )
+
+        self.pad_controls.append(
+            self.pad_px_label
+        )
+
+        self.pad_cancel_button: Gtk.Button = (
+            Gtk.Button(
+                label="Cancel",
+            )
+        )
+
+        self.pad_cancel_button.connect(
+            "clicked",
+            self.on_pad_cancel,
+        )
+
+        self.pad_controls.append(
+            self.pad_cancel_button
+        )
+
+        self.pad_save_button: Gtk.Button = (
+            Gtk.Button(
+                label="Ok",
+            )
+        )
+
+        self.pad_save_button.add_css_class(
+            "suggested-action"
+        )
+
+        self.pad_save_button.connect(
+            "clicked",
+            self.on_pad_save,
+        )
+
+        self.pad_controls.append(
+            self.pad_save_button
         )
 
         # --------------------------------------------------------------------
@@ -941,6 +1115,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.controls_box.append(
             self.crop_controls
+        )
+
+        self.controls_box.append(
+            self.pad_controls
         )
 
         self.controls_box.append(
@@ -1433,6 +1611,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.tile_size,
                 item.crop_ratio,
                 item.size_mode,
+                item.padding,
             )
         )
 
@@ -1500,6 +1679,7 @@ class MainWindow(Gtk.ApplicationWindow):
         *,
         pending_crop_ratio: CropRatio | None = None,
         pending_size_mode: SizeMode | None = None,
+        pending_padding: int | None = None,
     ) -> None:
         if item.picture is None:
             return
@@ -1516,6 +1696,12 @@ class MainWindow(Gtk.ApplicationWindow):
             else pending_size_mode
         )
 
+        padding: int = (
+            item.padding
+            if pending_padding is None
+            else max(0, pending_padding)
+        )
+
         preview: Image.Image = (
             make_preview(
                 item.image,
@@ -1523,6 +1709,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.tile_size,
                 crop_ratio,
                 size_mode,
+                padding,
             )
         )
 
@@ -1603,6 +1790,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 False
             )
 
+            self.pad_button.set_sensitive(
+                False
+            )
+
             self.size_button.set_sensitive(
                 False
             )
@@ -1631,11 +1822,18 @@ class MainWindow(Gtk.ApplicationWindow):
             else "original"
         )
 
+        padding_text: str = (
+            f"{item.padding}px"
+            if item.padding > 0
+            else "none"
+        )
+
         self.selection_label.set_text(
             f"{item.path.name}  —  "
             f"BG #{r:02X}{g:02X}{b:02X} "
             f"({bg_source})  —  "
             f"Crop: {crop_text}  —  "
+            f"Pad: {padding_text}  —  "
             f"Size: {item.size_mode}"
         )
 
@@ -1644,6 +1842,10 @@ class MainWindow(Gtk.ApplicationWindow):
         )
 
         self.crop_button.set_sensitive(
+            True
+        )
+
+        self.pad_button.set_sensitive(
             True
         )
 
@@ -1746,6 +1948,104 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.editor_mode = None
         self.pending_crop_ratio = None
+
+        self.refresh_thumbnail(
+            item
+        )
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    # ========================================================================
+    # Pad editor
+    # ========================================================================
+
+    def on_pad_clicked(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        self.editor_mode = "pad"
+
+        self.pending_padding = item.padding
+
+        self.pad_entry.set_value(
+            self.pending_padding
+        )
+
+        self.update_editor_visibility()
+
+        self.refresh_thumbnail(
+            item,
+            pending_padding=self.pending_padding,
+        )
+
+    def on_pad_value_changed(
+        self,
+        _spin_button: Gtk.SpinButton,
+    ) -> None:
+        if self.editor_mode != "pad":
+            return
+
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        self.pending_padding = max(
+            0,
+            int(self.pad_entry.get_value()),
+        )
+
+        self.refresh_thumbnail(
+            item,
+            pending_padding=self.pending_padding,
+        )
+
+    def on_pad_cancel(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is not None:
+            self.refresh_thumbnail(
+                item
+            )
+
+        self.editor_mode = None
+        self.pending_padding = 0
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    def on_pad_save(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        item.padding = max(
+            0,
+            int(self.pending_padding),
+        )
+
+        self.editor_mode = None
 
         self.refresh_thumbnail(
             item
@@ -1869,6 +2169,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 False
             )
 
+            self.pad_button.set_visible(
+                False
+            )
+
             self.size_button.set_visible(
                 False
             )
@@ -1885,6 +2189,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 False
             )
 
+            self.pad_controls.set_visible(
+                False
+            )
+
             self.size_controls.set_visible(
                 False
             )
@@ -1893,6 +2201,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.crop_button.set_visible(
             self.editor_mode != "crop"
+        )
+
+        self.pad_button.set_visible(
+            self.editor_mode != "pad"
         )
 
         self.size_button.set_visible(
@@ -1909,6 +2221,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.crop_controls.set_visible(
             self.editor_mode == "crop"
+        )
+
+        self.pad_controls.set_visible(
+            self.editor_mode == "pad"
         )
 
         self.size_controls.set_visible(
@@ -2142,6 +2458,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             aspect_ratio,
                             item.crop_ratio,
                             item.size_mode,
+                            item.padding,
                         )
                     )
 
