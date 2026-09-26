@@ -27,7 +27,7 @@ jobs:
         run: uv --version
 
       - name: Install impf
-        run: make install
+        run: sudo make install
 
       - name: Check impf is installed
         run: |
