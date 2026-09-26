@@ -20,37 +20,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Install on Unix
-        if: runner.os != 'Windows'
+      - name: Install uv on Linux
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          export PREFIX="$RUNNER_TEMP/impf"
-          mkdir -p "$PREFIX/bin"
-          echo "$PREFIX/bin" >> "$GITHUB_PATH"
-          make install
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install on Windows
+      - name: Install uv on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install uv on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $InstallPath = Join-Path $env:RUNNER_TEMP "impf"
-          New-Item -ItemType Directory -Force $InstallPath | Out-Null
-          $env:PATH = "$InstallPath;$env:PATH"
-          Add-Content $env:GITHUB_PATH $InstallPath
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.local\bin"
 
+      - name: Verify uv
+        shell: bash
+        run: |
+          uv --version
+
+      - name: Install impf on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          make install
+
+      - name: Install impf on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
           ./install.ps1
 
-      - name: Check impf is in PATH
+      - name: Check impf is in PATH on Unix
         if: runner.os != 'Windows'
         shell: bash
         run: |
           command -v impf
           impf --help
 
-      - name: Check impf is in PATH
+      - name: Check impf is in PATH on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
