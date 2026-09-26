@@ -1,0 +1,2330 @@
+#!/usr/bin/env -S uv run --script
+# -*- mode: python -*-
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "Pillow>=11.0",
+#     "PyGObject>=3.50",
+# ]
+# ///
+
+import math
+import sys
+import threading
+from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import TypeAlias
+
+import gi
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+gi.require_version("Gtk", "4.0")
+
+from gi.repository import Gdk, Gio, GLib, Gtk
+from PIL import Image, ImageOps
+
+
+# ============================================================================
+# Types
+# ============================================================================
+
+RGBColor: TypeAlias = tuple[int, int, int]
+ImageLoadResult: TypeAlias = tuple[Path, Image.Image, RGBColor]
+CropRatio: TypeAlias = str | None
+SizeMode: TypeAlias = str
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+APP_ID = "com.example.ImageBackgroundTool"
+APP_TITLE = "Image Background Tool"
+
+SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
+    {
+	".avif",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".bmp",
+        ".gif",
+        ".tif",
+        ".tiff",
+    }
+)
+
+SCREEN_DIVISOR = 8
+PREVIEW_MARGIN = 10
+
+CROP_RATIOS: tuple[str, ...] = (
+    "1:1",
+    "4:3",
+    "3:4",
+    "16:9",
+    "9:16",
+)
+
+SIZE_MODES: tuple[str, ...] = (
+    "fit",
+    "fill",
+)
+
+
+# ============================================================================
+# Image processing
+# ============================================================================
+
+def ratio_value(ratio: str) -> float:
+    """Convert '16:9' into a floating point aspect ratio."""
+    width, height = ratio.split(":")
+
+    return int(width) / int(height)
+
+
+def crop_image(
+    image: Image.Image,
+    ratio: CropRatio,
+) -> Image.Image:
+    """
+    Center-crop an image to the requested aspect ratio.
+
+    If ratio is None, the image is returned unchanged.
+    """
+    source: Image.Image = ImageOps.exif_transpose(
+        image
+    ).convert("RGBA")
+
+    if ratio is None:
+        return source.copy()
+
+    target_ratio: float = ratio_value(ratio)
+
+    width: int
+    height: int
+    width, height = source.size
+
+    current_ratio: float = width / height
+
+    if math.isclose(
+        current_ratio,
+        target_ratio,
+        rel_tol=1e-6,
+    ):
+        return source.copy()
+
+    if current_ratio > target_ratio:
+        # Image is too wide.
+        # Crop horizontally.
+        new_width: int = max(
+            1,
+            round(height * target_ratio),
+        )
+
+        left: int = (width - new_width) // 2
+
+        return source.crop(
+            (
+                left,
+                0,
+                left + new_width,
+                height,
+            )
+        )
+
+    # Image is too tall.
+    # Crop vertically.
+    new_height: int = max(
+        1,
+        round(width / target_ratio),
+    )
+
+    top: int = (height - new_height) // 2
+
+    return source.crop(
+        (
+            0,
+            top,
+            width,
+            top + new_height,
+        )
+    )
+
+
+def detect_background(
+    image: Image.Image,
+) -> RGBColor:
+    """
+    Estimate the background color by sampling the four corners.
+
+    Colors are quantized before counting so slightly different shades
+    are grouped together.
+    """
+    rgb: Image.Image = image.convert("RGB")
+
+    width: int
+    height: int
+    width, height = rgb.size
+
+    sample_width: int = max(
+        2,
+        int(width * 0.08),
+    )
+
+    sample_height: int = max(
+        2,
+        int(height * 0.08),
+    )
+
+    regions: list[Image.Image] = [
+        rgb.crop(
+            (
+                0,
+                0,
+                sample_width,
+                sample_height,
+            )
+        ),
+        rgb.crop(
+            (
+                width - sample_width,
+                0,
+                width,
+                sample_height,
+            )
+        ),
+        rgb.crop(
+            (
+                0,
+                height - sample_height,
+                sample_width,
+                height,
+            )
+        ),
+        rgb.crop(
+            (
+                width - sample_width,
+                height - sample_height,
+                width,
+                height,
+            )
+        ),
+    ]
+
+    samples: list[tuple[int, int, int]] = []
+
+    for region in regions:
+        region.thumbnail(
+            (32, 32),
+            Image.Resampling.BILINEAR,
+        )
+
+        samples.extend(
+            (
+                int(r),
+                int(g),
+                int(b),
+            )
+            for r, g, b in region.getdata()
+        )
+
+    if not samples:
+        return 128, 128, 128
+
+    buckets: Counter[
+        tuple[int, int, int]
+    ] = Counter(
+        (
+            (r // 16) * 16,
+            (g // 16) * 16,
+            (b // 16) * 16,
+        )
+        for r, g, b in samples
+    )
+
+    bucket: tuple[int, int, int] = (
+        buckets.most_common(1)[0][0]
+    )
+
+    matching: list[
+        tuple[int, int, int]
+    ] = [
+        pixel
+        for pixel in samples
+        if all(
+            abs(
+                pixel[channel]
+                - bucket[channel]
+            ) <= 16
+            for channel in range(3)
+        )
+    ]
+
+    if not matching:
+        matching = samples
+
+    result: list[int] = []
+
+    for channel in range(3):
+        values: list[int] = sorted(
+            pixel[channel]
+            for pixel in matching
+        )
+
+        result.append(
+            values[len(values) // 2]
+        )
+
+    return (
+        result[0],
+        result[1],
+        result[2],
+    )
+
+
+def apply_size_mode(
+    image: Image.Image,
+    canvas_size: tuple[int, int],
+    size_mode: SizeMode,
+) -> Image.Image:
+    """
+    Scale an image to a canvas.
+
+    fit:
+        Entire image remains visible.
+
+    fill:
+        Image covers the entire canvas and overflow is cropped.
+    """
+    canvas_width: int
+    canvas_height: int
+    canvas_width, canvas_height = canvas_size
+
+    source: Image.Image = image.convert("RGBA")
+
+    if size_mode == "fill":
+        return ImageOps.fit(
+            source,
+            (canvas_width, canvas_height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+
+    return ImageOps.contain(
+        source,
+        (canvas_width, canvas_height),
+        method=Image.Resampling.LANCZOS,
+    )
+
+
+def make_preview(
+    image: Image.Image,
+    background: RGBColor,
+    tile_size: tuple[int, int],
+    crop_ratio: CropRatio,
+    size_mode: SizeMode,
+) -> Image.Image:
+    """
+    Create the thumbnail preview.
+
+    Crop is applied first, then Fit/Fill is applied to the screen-aspect
+    preview area.
+    """
+    tile_width: int
+    tile_height: int
+    tile_width, tile_height = tile_size
+
+    canvas: Image.Image = Image.new(
+        "RGBA",
+        (tile_width, tile_height),
+        (*background, 255),
+    )
+
+    cropped: Image.Image = crop_image(
+        image,
+        crop_ratio,
+    )
+
+    available_width: int = max(
+        1,
+        tile_width - PREVIEW_MARGIN * 2,
+    )
+
+    available_height: int = max(
+        1,
+        tile_height - PREVIEW_MARGIN * 2,
+    )
+
+    if size_mode == "fill":
+        fitted: Image.Image = apply_size_mode(
+            cropped,
+            (
+                available_width,
+                available_height,
+            ),
+            "fill",
+        )
+
+        x: int = PREVIEW_MARGIN
+        y: int = PREVIEW_MARGIN
+
+        canvas.alpha_composite(
+            fitted,
+            (x, y),
+        )
+
+        return canvas
+
+    fitted = apply_size_mode(
+        cropped,
+        (
+            available_width,
+            available_height,
+        ),
+        "fit",
+    )
+
+    x = (
+        tile_width - fitted.width
+    ) // 2
+
+    y = (
+        tile_height - fitted.height
+    ) // 2
+
+    canvas.alpha_composite(
+        fitted,
+        (x, y),
+    )
+
+    return canvas
+
+
+def make_output_image(
+    image: Image.Image,
+    background: RGBColor,
+    aspect_ratio: float,
+    crop_ratio: CropRatio,
+    size_mode: SizeMode,
+) -> Image.Image:
+    """
+    Create the final saved image.
+
+    The output canvas uses the monitor/screen aspect ratio.
+
+    Processing order:
+
+        original image
+             ↓
+        crop
+             ↓
+        fit/fill into screen-aspect canvas
+             ↓
+        background where required
+    """
+    cropped: Image.Image = crop_image(
+        image,
+        crop_ratio,
+    )
+
+    source_width: int
+    source_height: int
+
+    source_width, source_height = (
+        cropped.size
+    )
+
+    # For FIT, preserve the original cropped pixel dimensions and expand
+    # the canvas to the requested aspect ratio.
+    if size_mode == "fit":
+        canvas_width: int = source_width
+        canvas_height: int = source_height
+
+        current_ratio: float = (
+            source_width / source_height
+        )
+
+        if current_ratio > aspect_ratio:
+            canvas_height = math.ceil(
+                source_width / aspect_ratio
+            )
+        else:
+            canvas_width = math.ceil(
+                source_height * aspect_ratio
+            )
+
+        canvas: Image.Image = Image.new(
+            "RGBA",
+            (
+                canvas_width,
+                canvas_height,
+            ),
+            (*background, 255),
+        )
+
+        x: int = (
+            canvas_width - source_width
+        ) // 2
+
+        y: int = (
+            canvas_height - source_height
+        ) // 2
+
+        canvas.alpha_composite(
+            cropped,
+            (x, y),
+        )
+
+        return canvas
+
+    # For FILL, the output canvas is the screen aspect ratio and the
+    # image is scaled to completely cover it.
+    #
+    # Preserve the source dimensions where possible while making the
+    # final canvas large enough to contain the scaled image.
+    canvas_width = source_width
+    canvas_height = source_height
+
+    current_ratio = (
+        source_width / source_height
+    )
+
+    if current_ratio > aspect_ratio:
+        canvas_height = math.ceil(
+            source_width / aspect_ratio
+        )
+    else:
+        canvas_width = math.ceil(
+            source_height * aspect_ratio
+        )
+
+    filled: Image.Image = ImageOps.fit(
+        cropped,
+        (
+            canvas_width,
+            canvas_height,
+        ),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+    # ImageOps.fit already produces the complete canvas.
+    return filled
+
+
+def image_to_texture(
+    image: Image.Image,
+) -> Gdk.Texture:
+    """Convert a Pillow image to a GDK texture."""
+    rgba: Image.Image = image.convert(
+        "RGBA"
+    )
+
+    width: int
+    height: int
+    width, height = rgba.size
+
+    data: bytes = rgba.tobytes()
+    stride: int = width * 4
+
+    glib_bytes: GLib.Bytes = (
+        GLib.Bytes.new(data)
+    )
+
+    return Gdk.MemoryTexture.new(
+        width,
+        height,
+        Gdk.MemoryFormat.R8G8B8A8,
+        glib_bytes,
+        stride,
+    )
+
+
+def load_image(
+    path: Path,
+) -> ImageLoadResult:
+    """Load an image and detect its background."""
+    with Image.open(path) as opened:
+        image: Image.Image = (
+            ImageOps.exif_transpose(
+                opened
+            ).convert("RGBA")
+        )
+
+        image.load()
+
+    background: RGBColor = (
+        detect_background(image)
+    )
+
+    return (
+        path,
+        image,
+        background,
+    )
+
+
+# ============================================================================
+# Image item
+# ============================================================================
+
+class ImageItem:
+    """All state associated with one image."""
+
+    def __init__(
+        self,
+        path: Path,
+        image: Image.Image,
+        detected_background: RGBColor,
+    ) -> None:
+        self.path: Path = path
+        self.image: Image.Image = image
+
+        self.detected_background: RGBColor = (
+            detected_background
+        )
+
+        self.custom_background: RGBColor | None = (
+            None
+        )
+
+        # Persistent editing state.
+        self.crop_ratio: CropRatio = None
+        self.size_mode: SizeMode = "fit"
+
+        # GTK widgets.
+        self.button: Gtk.Button | None = None
+        self.picture: Gtk.Picture | None = None
+        self.texture: Gdk.Texture | None = None
+
+    @property
+    def background(self) -> RGBColor:
+        if self.custom_background is not None:
+            return self.custom_background
+
+        return self.detected_background
+
+
+# ============================================================================
+# Main window
+# ============================================================================
+
+class MainWindow(Gtk.ApplicationWindow):
+    def __init__(
+        self,
+        application: Gtk.Application,
+    ) -> None:
+        super().__init__(
+            application=application,
+            title=APP_TITLE,
+        )
+
+        self.set_default_size(
+            1200,
+            800,
+        )
+
+        self.current_folder: Path | None = None
+
+        self.items: list[ImageItem] = []
+
+        self.selected_item: ImageItem | None = (
+            None
+        )
+
+        self.executor: ThreadPoolExecutor = (
+            ThreadPoolExecutor(
+                max_workers=6
+            )
+        )
+
+        self.tile_size: tuple[int, int] = (
+            self.get_tile_size()
+        )
+
+        # Editing UI state.
+        self.editor_mode: str | None = None
+
+        self.pending_crop_ratio: CropRatio = None
+        self.pending_size_mode: SizeMode = "fit"
+
+        self.build_ui()
+        self.apply_css()
+
+        self.connect(
+            "close-request",
+            self.on_close_request,
+        )
+
+        GLib.idle_add(
+            self.open_folder_dialog
+        )
+
+    # ========================================================================
+    # UI
+    # ========================================================================
+
+    def build_ui(self) -> None:
+        root: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=0,
+        )
+
+        self.set_child(root)
+
+        # --------------------------------------------------------------------
+        # Header
+        # --------------------------------------------------------------------
+
+        header: Gtk.HeaderBar = Gtk.HeaderBar()
+
+        title: Gtk.Label = Gtk.Label(
+            label=APP_TITLE,
+        )
+
+        title.add_css_class("title")
+
+        header.set_title_widget(title)
+
+        root.append(header)
+
+        # --------------------------------------------------------------------
+        # Selection / editing bar
+        # --------------------------------------------------------------------
+
+        self.selection_bar: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+
+        self.selection_bar.set_margin_top(8)
+        self.selection_bar.set_margin_start(12)
+        self.selection_bar.set_margin_end(12)
+        self.selection_bar.set_margin_bottom(8)
+
+        self.selection_label: Gtk.Label = (
+            Gtk.Label(
+                label="No image selected",
+                xalign=0,
+            )
+        )
+
+        self.selection_label.set_hexpand(True)
+
+        # Normal selection buttons.
+        self.set_bg_button: Gtk.Button = (
+            Gtk.Button(
+                label="Set BG",
+            )
+        )
+
+        self.set_bg_button.connect(
+            "clicked",
+            self.on_set_background,
+        )
+
+        self.crop_button: Gtk.Button = (
+            Gtk.Button(
+                label="Crop",
+            )
+        )
+
+        self.crop_button.connect(
+            "clicked",
+            self.on_crop_clicked,
+        )
+
+        self.size_button: Gtk.Button = (
+            Gtk.Button(
+                label="Size",
+            )
+        )
+
+        self.size_button.connect(
+            "clicked",
+            self.on_size_clicked,
+        )
+
+        self.clear_selection_button: Gtk.Button = (
+            Gtk.Button(
+                icon_name="window-close-symbolic",
+            )
+        )
+
+        self.clear_selection_button.set_tooltip_text(
+            "Unselect image"
+        )
+
+        self.clear_selection_button.connect(
+            "clicked",
+            self.on_clear_selection,
+        )
+
+        self.selection_bar.append(
+            self.selection_label
+        )
+
+        self.selection_bar.append(
+            self.set_bg_button
+        )
+
+        self.selection_bar.append(
+            self.crop_button
+        )
+
+        self.selection_bar.append(
+            self.size_button
+        )
+
+        self.selection_bar.append(
+            self.clear_selection_button
+        )
+
+        # --------------------------------------------------------------------
+        # Crop controls
+        # --------------------------------------------------------------------
+
+        self.crop_controls: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+        )
+
+        self.crop_label: Gtk.Label = Gtk.Label(
+            label="Crop:",
+        )
+
+        self.crop_controls.append(
+            self.crop_label
+        )
+
+        self.crop_buttons: dict[
+            str,
+            Gtk.Button,
+        ] = {}
+
+        for ratio in CROP_RATIOS:
+            button: Gtk.Button = Gtk.Button(
+                label=ratio
+            )
+
+            button.connect(
+                "clicked",
+                self.on_crop_ratio_clicked,
+                ratio,
+            )
+
+            self.crop_buttons[ratio] = button
+
+            self.crop_controls.append(button)
+
+        self.crop_cancel_button: Gtk.Button = (
+            Gtk.Button(
+                label="Cancel",
+            )
+        )
+
+        self.crop_cancel_button.connect(
+            "clicked",
+            self.on_crop_cancel,
+        )
+
+        self.crop_save_button: Gtk.Button = (
+            Gtk.Button(
+                label="Save",
+            )
+        )
+
+        self.crop_save_button.add_css_class(
+            "suggested-action"
+        )
+
+        self.crop_save_button.connect(
+            "clicked",
+            self.on_crop_save,
+        )
+
+        self.crop_controls.append(
+            self.crop_cancel_button
+        )
+
+        self.crop_controls.append(
+            self.crop_save_button
+        )
+
+        # --------------------------------------------------------------------
+        # Size controls
+        # --------------------------------------------------------------------
+
+        self.size_controls: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+        )
+
+        self.size_label: Gtk.Label = Gtk.Label(
+            label="Size:",
+        )
+
+        self.size_controls.append(
+            self.size_label
+        )
+
+        self.size_buttons: dict[
+            str,
+            Gtk.Button,
+        ] = {}
+
+        for mode in SIZE_MODES:
+            button: Gtk.Button = Gtk.Button(
+                label=mode.capitalize()
+            )
+
+            button.connect(
+                "clicked",
+                self.on_size_mode_clicked,
+                mode,
+            )
+
+            self.size_buttons[mode] = button
+
+            self.size_controls.append(button)
+
+        self.size_cancel_button: Gtk.Button = (
+            Gtk.Button(
+                label="Cancel",
+            )
+        )
+
+        self.size_cancel_button.connect(
+            "clicked",
+            self.on_size_cancel,
+        )
+
+        self.size_save_button: Gtk.Button = (
+            Gtk.Button(
+                label="Save",
+            )
+        )
+
+        self.size_save_button.add_css_class(
+            "suggested-action"
+        )
+
+        self.size_save_button.connect(
+            "clicked",
+            self.on_size_save,
+        )
+
+        self.size_controls.append(
+            self.size_cancel_button
+        )
+
+        self.size_controls.append(
+            self.size_save_button
+        )
+
+        # --------------------------------------------------------------------
+        # Selection area container
+        # --------------------------------------------------------------------
+
+        self.controls_box: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+        )
+
+        self.controls_box.append(
+            self.selection_bar
+        )
+
+        self.controls_box.append(
+            self.crop_controls
+        )
+
+        self.controls_box.append(
+            self.size_controls
+        )
+
+        root.append(self.controls_box)
+
+        # --------------------------------------------------------------------
+        # Image area
+        # --------------------------------------------------------------------
+
+        self.scrolled: Gtk.ScrolledWindow = (
+            Gtk.ScrolledWindow()
+        )
+
+        self.scrolled.set_vexpand(True)
+        self.scrolled.set_hexpand(True)
+
+        self.flowbox: Gtk.FlowBox = (
+            Gtk.FlowBox()
+        )
+
+        self.flowbox.set_selection_mode(
+            Gtk.SelectionMode.NONE
+        )
+
+        self.flowbox.set_activate_on_single_click(
+            True
+        )
+
+        self.flowbox.set_row_spacing(10)
+        self.flowbox.set_column_spacing(10)
+        self.flowbox.set_homogeneous(True)
+
+        self.flowbox.set_min_children_per_line(
+            1
+        )
+
+        self.flowbox.set_max_children_per_line(
+            16
+        )
+
+        self.scrolled.set_child(
+            self.flowbox
+        )
+
+        root.append(self.scrolled)
+
+        # --------------------------------------------------------------------
+        # Status
+        # --------------------------------------------------------------------
+
+        self.status_label: Gtk.Label = (
+            Gtk.Label(
+                label="Choose an image folder to begin.",
+                xalign=0,
+            )
+        )
+
+        self.status_label.set_margin_start(12)
+        self.status_label.set_margin_end(12)
+        self.status_label.set_margin_top(6)
+        self.status_label.set_margin_bottom(6)
+
+        self.status_label.add_css_class(
+            "dim-label"
+        )
+
+        root.append(self.status_label)
+
+        # --------------------------------------------------------------------
+        # Bottom toolbar
+        # --------------------------------------------------------------------
+
+        toolbar: Gtk.Box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+        )
+
+        toolbar.set_margin_top(8)
+        toolbar.set_margin_start(12)
+        toolbar.set_margin_end(12)
+        toolbar.set_margin_bottom(12)
+
+        self.folder_label: Gtk.Label = (
+            Gtk.Label(
+                label="No folder selected",
+                xalign=0,
+            )
+        )
+
+        self.folder_label.set_hexpand(True)
+
+        self.save_button: Gtk.Button = (
+            Gtk.Button(
+                label="Save All",
+            )
+        )
+
+        self.save_button.add_css_class(
+            "suggested-action"
+        )
+
+        self.save_button.set_sensitive(
+            False
+        )
+
+        self.save_button.connect(
+            "clicked",
+            self.on_save_all,
+        )
+
+        self.cancel_button: Gtk.Button = (
+            Gtk.Button(
+                label="Cancel",
+            )
+        )
+
+        self.cancel_button.connect(
+            "clicked",
+            self.on_cancel_folder,
+        )
+
+        self.exit_button: Gtk.Button = (
+            Gtk.Button(
+                label="Exit",
+            )
+        )
+
+        self.exit_button.connect(
+            "clicked",
+            self.on_exit,
+        )
+
+        toolbar.append(
+            self.folder_label
+        )
+
+        toolbar.append(
+            self.save_button
+        )
+
+        toolbar.append(
+            self.cancel_button
+        )
+
+        toolbar.append(
+            self.exit_button
+        )
+
+        root.append(toolbar)
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    def apply_css(self) -> None:
+        css: bytes = b"""
+        .title {
+            font-weight: 700;
+        }
+
+        .dim-label {
+            opacity: 0.7;
+        }
+
+        .thumbnail-button {
+            padding: 0;
+            border-radius: 6px;
+        }
+
+        .thumbnail-button:hover {
+            filter: brightness(1.08);
+        }
+
+        .thumbnail-button:focus {
+            outline: 3px solid @accent_color;
+        }
+
+        .editor-active {
+            background-color: alpha(@accent_color, 0.10);
+            border-radius: 6px;
+        }
+        """
+
+        provider: Gtk.CssProvider = (
+            Gtk.CssProvider()
+        )
+
+        provider.load_from_data(css)
+
+        display: Gdk.Display | None = (
+            Gdk.Display.get_default()
+        )
+
+        if display is None:
+            return
+
+        Gtk.StyleContext.add_provider_for_display(
+            display,
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    # ========================================================================
+    # Monitor / thumbnail sizing
+    # ========================================================================
+
+    def get_tile_size(
+        self,
+    ) -> tuple[int, int]:
+        """
+        Return approximately 1/8 of the current monitor dimensions.
+        """
+        display: Gdk.Display | None = (
+            Gdk.Display.get_default()
+        )
+
+        if display is None:
+            return 240, 135
+
+        monitor: Gdk.Monitor | None = None
+
+        surface: Gdk.Surface | None = (
+            self.get_surface()
+        )
+
+        if surface is not None:
+            try:
+                monitor = (
+                    display.get_monitor_at_surface(
+                        surface
+                    )
+                )
+            except Exception:
+                monitor = None
+
+        if monitor is None:
+            monitors: Gio.ListModel = (
+                display.get_monitors()
+            )
+
+            if monitors.get_n_items() > 0:
+                monitor = monitors.get_item(0)
+
+        if monitor is None:
+            return 240, 135
+
+        geometry: Gdk.Rectangle = (
+            monitor.get_geometry()
+        )
+
+        width: int = max(
+            160,
+            geometry.width // SCREEN_DIVISOR,
+        )
+
+        height: int = max(
+            90,
+            geometry.height // SCREEN_DIVISOR,
+        )
+
+        return width, height
+
+    # ========================================================================
+    # Folder selection
+    # ========================================================================
+
+    def open_folder_dialog(
+        self,
+        *_args: object,
+    ) -> bool:
+        dialog: Gtk.FileDialog = (
+            Gtk.FileDialog()
+        )
+
+        dialog.set_title(
+            "Select Image Folder"
+        )
+
+        dialog.set_modal(True)
+
+        dialog.select_folder(
+            self,
+            None,
+            self.on_folder_selected,
+        )
+
+        return False
+
+    def on_folder_selected(
+        self,
+        dialog: Gtk.FileDialog,
+        result: Gio.AsyncResult,
+    ) -> None:
+        try:
+            folder: Gio.File | None = (
+                dialog.select_folder_finish(
+                    result
+                )
+            )
+        except GLib.Error:
+            return
+
+        if folder is None:
+            return
+
+        path: str | None = folder.get_path()
+
+        if path is None:
+            return
+
+        self.load_folder(
+            Path(path)
+        )
+
+    def load_folder(
+        self,
+        folder: Path,
+    ) -> None:
+        self.current_folder = folder
+
+        self.items.clear()
+        self.selected_item = None
+
+        self.editor_mode = None
+
+        self.flowbox.remove_all()
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+        self.folder_label.set_text(
+            str(folder)
+        )
+
+        self.status_label.set_text(
+            "Scanning images…"
+        )
+
+        self.save_button.set_sensitive(
+            False
+        )
+
+        try:
+            files: list[Path] = sorted(
+                (
+                    path
+                    for path in folder.iterdir()
+                    if (
+                        path.is_file()
+                        and path.suffix.lower()
+                        in SUPPORTED_EXTENSIONS
+                    )
+                ),
+                key=lambda path: path.name.lower(),
+            )
+        except OSError as exc:
+            self.status_label.set_text(
+                f"Could not read folder: {exc}"
+            )
+            return
+
+        if not files:
+            self.status_label.set_text(
+                "No supported images were found."
+            )
+            return
+
+        self.status_label.set_text(
+            f"Loading {len(files)} image(s)…"
+        )
+
+        worker: threading.Thread = (
+            threading.Thread(
+                target=self.load_images_worker,
+                args=(files, folder),
+                daemon=True,
+            )
+        )
+
+        worker.start()
+
+    def load_images_worker(
+        self,
+        files: list[Path],
+        folder: Path,
+    ) -> None:
+        futures: dict[
+            Future[ImageLoadResult],
+            Path,
+        ] = {
+            self.executor.submit(
+                load_image,
+                path,
+            ): path
+            for path in files
+        }
+
+        loaded: list[
+            ImageLoadResult
+        ] = []
+
+        errors: list[
+            tuple[Path, str]
+        ] = []
+
+        for future in as_completed(
+            futures
+        ):
+            path: Path = futures[future]
+
+            try:
+                loaded.append(
+                    future.result()
+                )
+            except Exception as exc:
+                errors.append(
+                    (
+                        path,
+                        str(exc),
+                    )
+                )
+
+        loaded.sort(
+            key=lambda value: (
+                value[0].name.lower()
+            )
+        )
+
+        GLib.idle_add(
+            self.finish_loading_images,
+            loaded,
+            errors,
+            folder,
+        )
+
+    def finish_loading_images(
+        self,
+        loaded: list[ImageLoadResult],
+        errors: list[tuple[Path, str]],
+        folder: Path,
+    ) -> bool:
+        if self.current_folder != folder:
+            return False
+
+        for path, image, background in loaded:
+            item: ImageItem = ImageItem(
+                path,
+                image,
+                background,
+            )
+
+            self.items.append(item)
+
+            self.add_thumbnail(
+                item
+            )
+
+        count: int = len(self.items)
+
+        if errors:
+            self.status_label.set_text(
+                f"Loaded {count} image(s); "
+                f"{len(errors)} could not be read."
+            )
+        else:
+            self.status_label.set_text(
+                f"{count} image(s) loaded."
+            )
+
+        self.save_button.set_sensitive(
+            count > 0
+        )
+
+        return False
+
+    # ========================================================================
+    # Thumbnail handling
+    # ========================================================================
+
+    def add_thumbnail(
+        self,
+        item: ImageItem,
+    ) -> None:
+        preview: Image.Image = (
+            make_preview(
+                item.image,
+                item.background,
+                self.tile_size,
+                item.crop_ratio,
+                item.size_mode,
+            )
+        )
+
+        item.texture = image_to_texture(
+            preview
+        )
+
+        picture: Gtk.Picture = (
+            Gtk.Picture.new_for_paintable(
+                item.texture
+            )
+        )
+
+        picture.set_content_fit(
+            Gtk.ContentFit.CONTAIN
+        )
+
+        picture.set_can_shrink(
+            True
+        )
+
+        picture.set_size_request(
+            self.tile_size[0],
+            self.tile_size[1],
+        )
+
+        item.picture = picture
+
+        button: Gtk.Button = (
+            Gtk.Button()
+        )
+
+        button.set_child(
+            picture
+        )
+
+        button.set_size_request(
+            self.tile_size[0],
+            self.tile_size[1],
+        )
+
+        button.add_css_class(
+            "thumbnail-button"
+        )
+
+        button.set_tooltip_text(
+            item.path.name
+        )
+
+        button.connect(
+            "clicked",
+            self.on_thumbnail_clicked,
+            item,
+        )
+
+        item.button = button
+
+        self.flowbox.append(
+            button
+        )
+
+    def refresh_thumbnail(
+        self,
+        item: ImageItem,
+        *,
+        pending_crop_ratio: CropRatio | None = None,
+        pending_size_mode: SizeMode | None = None,
+    ) -> None:
+        if item.picture is None:
+            return
+
+        crop_ratio: CropRatio = (
+            item.crop_ratio
+            if pending_crop_ratio is None
+            else pending_crop_ratio
+        )
+
+        size_mode: SizeMode = (
+            item.size_mode
+            if pending_size_mode is None
+            else pending_size_mode
+        )
+
+        preview: Image.Image = (
+            make_preview(
+                item.image,
+                item.background,
+                self.tile_size,
+                crop_ratio,
+                size_mode,
+            )
+        )
+
+        item.texture = image_to_texture(
+            preview
+        )
+
+        item.picture.set_paintable(
+            item.texture
+        )
+
+    # ========================================================================
+    # Selection
+    # ========================================================================
+
+    def on_thumbnail_clicked(
+        self,
+        _button: Gtk.Button,
+        item: ImageItem,
+    ) -> None:
+        # Clicking another image exits any unfinished editor.
+        self.editor_mode = None
+
+        if self.selected_item is not None:
+            old_button: Gtk.Button | None = (
+                self.selected_item.button
+            )
+
+            if old_button is not None:
+                old_button.remove_css_class(
+                    "selected"
+                )
+
+        self.selected_item = item
+
+        if item.button is not None:
+            item.button.add_css_class(
+                "selected"
+            )
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    def on_clear_selection(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        self.editor_mode = None
+
+        if self.selected_item is not None:
+            if self.selected_item.button is not None:
+                self.selected_item.button.remove_css_class(
+                    "selected"
+                )
+
+        self.selected_item = None
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    def update_selection_ui(
+        self,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            self.selection_label.set_text(
+                "No image selected"
+            )
+
+            self.set_bg_button.set_sensitive(
+                False
+            )
+
+            self.crop_button.set_sensitive(
+                False
+            )
+
+            self.size_button.set_sensitive(
+                False
+            )
+
+            self.clear_selection_button.set_sensitive(
+                False
+            )
+
+            return
+
+        r: int
+        g: int
+        b: int
+
+        r, g, b = item.background
+
+        bg_source: str = (
+            "custom"
+            if item.custom_background is not None
+            else "detected"
+        )
+
+        crop_text: str = (
+            item.crop_ratio
+            if item.crop_ratio is not None
+            else "original"
+        )
+
+        self.selection_label.set_text(
+            f"{item.path.name}  —  "
+            f"BG #{r:02X}{g:02X}{b:02X} "
+            f"({bg_source})  —  "
+            f"Crop: {crop_text}  —  "
+            f"Size: {item.size_mode}"
+        )
+
+        self.set_bg_button.set_sensitive(
+            True
+        )
+
+        self.crop_button.set_sensitive(
+            True
+        )
+
+        self.size_button.set_sensitive(
+            True
+        )
+
+        self.clear_selection_button.set_sensitive(
+            True
+        )
+
+    # ========================================================================
+    # Crop editor
+    # ========================================================================
+
+    def on_crop_clicked(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        self.editor_mode = "crop"
+
+        self.pending_crop_ratio = (
+            item.crop_ratio
+        )
+
+        self.update_editor_visibility()
+
+        # Show the current setting immediately.
+        self.refresh_thumbnail(
+            item,
+            pending_crop_ratio=(
+                self.pending_crop_ratio
+            ),
+        )
+
+    def on_crop_ratio_clicked(
+        self,
+        _button: Gtk.Button,
+        ratio: str,
+    ) -> None:
+        if self.editor_mode != "crop":
+            return
+
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        self.pending_crop_ratio = ratio
+
+        self.refresh_thumbnail(
+            item,
+            pending_crop_ratio=ratio,
+        )
+
+        self.update_editor_button_state()
+
+    def on_crop_cancel(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is not None:
+            self.refresh_thumbnail(
+                item
+            )
+
+        self.editor_mode = None
+        self.pending_crop_ratio = None
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    def on_crop_save(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        item.crop_ratio = (
+            self.pending_crop_ratio
+        )
+
+        self.editor_mode = None
+        self.pending_crop_ratio = None
+
+        self.refresh_thumbnail(
+            item
+        )
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    # ========================================================================
+    # Size editor
+    # ========================================================================
+
+    def on_size_clicked(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        self.editor_mode = "size"
+
+        self.pending_size_mode = (
+            item.size_mode
+        )
+
+        self.update_editor_visibility()
+
+        self.refresh_thumbnail(
+            item,
+            pending_size_mode=(
+                self.pending_size_mode
+            ),
+        )
+
+    def on_size_mode_clicked(
+        self,
+        _button: Gtk.Button,
+        mode: str,
+    ) -> None:
+        if self.editor_mode != "size":
+            return
+
+        if mode not in SIZE_MODES:
+            return
+
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        self.pending_size_mode = mode
+
+        self.refresh_thumbnail(
+            item,
+            pending_size_mode=mode,
+        )
+
+        self.update_editor_button_state()
+
+    def on_size_cancel(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is not None:
+            self.refresh_thumbnail(
+                item
+            )
+
+        self.editor_mode = None
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    def on_size_save(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        item.size_mode = (
+            self.pending_size_mode
+        )
+
+        self.editor_mode = None
+
+        self.refresh_thumbnail(
+            item
+        )
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+    # ========================================================================
+    # Editor UI state
+    # ========================================================================
+
+    def update_editor_visibility(
+        self,
+    ) -> None:
+        has_selection: bool = (
+            self.selected_item is not None
+        )
+
+        if not has_selection:
+            self.crop_button.set_visible(
+                False
+            )
+
+            self.size_button.set_visible(
+                False
+            )
+
+            self.set_bg_button.set_visible(
+                False
+            )
+
+            self.clear_selection_button.set_visible(
+                False
+            )
+
+            self.crop_controls.set_visible(
+                False
+            )
+
+            self.size_controls.set_visible(
+                False
+            )
+
+            return
+
+        self.crop_button.set_visible(
+            self.editor_mode != "crop"
+        )
+
+        self.size_button.set_visible(
+            self.editor_mode != "size"
+        )
+
+        self.set_bg_button.set_visible(
+            self.editor_mode is None
+        )
+
+        self.clear_selection_button.set_visible(
+            self.editor_mode is None
+        )
+
+        self.crop_controls.set_visible(
+            self.editor_mode == "crop"
+        )
+
+        self.size_controls.set_visible(
+            self.editor_mode == "size"
+        )
+
+        self.update_editor_button_state()
+
+    def update_editor_button_state(
+        self,
+    ) -> None:
+        if self.editor_mode == "crop":
+            for ratio, button in (
+                self.crop_buttons.items()
+            ):
+                if ratio == self.pending_crop_ratio:
+                    button.add_css_class(
+                        "suggested-action"
+                    )
+                else:
+                    button.remove_css_class(
+                        "suggested-action"
+                    )
+
+        elif self.editor_mode == "size":
+            for mode, button in (
+                self.size_buttons.items()
+            ):
+                if mode == self.pending_size_mode:
+                    button.add_css_class(
+                        "suggested-action"
+                    )
+                else:
+                    button.remove_css_class(
+                        "suggested-action"
+                    )
+
+    # ========================================================================
+    # Background color picker
+    # ========================================================================
+
+    def on_set_background(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        item: ImageItem | None = (
+            self.selected_item
+        )
+
+        if item is None:
+            return
+
+        r: int
+        g: int
+        b: int
+
+        r, g, b = item.background
+
+        initial: Gdk.RGBA = Gdk.RGBA()
+
+        initial.red = r / 255.0
+        initial.green = g / 255.0
+        initial.blue = b / 255.0
+        initial.alpha = 1.0
+
+        dialog: Gtk.ColorDialog = (
+            Gtk.ColorDialog()
+        )
+
+        dialog.set_title(
+            "Choose Background Color"
+        )
+
+        dialog.set_modal(True)
+        dialog.set_with_alpha(False)
+
+        dialog.choose_rgba(
+            self,
+            initial,
+            None,
+            self.on_color_selected,
+            item,
+        )
+
+    def on_color_selected(
+        self,
+        dialog: Gtk.ColorDialog,
+        result: Gio.AsyncResult,
+        item: ImageItem,
+    ) -> None:
+        try:
+            rgba: Gdk.RGBA | None = (
+                dialog.choose_rgba_finish(
+                    result
+                )
+            )
+        except GLib.Error:
+            return
+
+        if rgba is None:
+            return
+
+        color: RGBColor = (
+            round(rgba.red * 255),
+            round(rgba.green * 255),
+            round(rgba.blue * 255),
+        )
+
+        item.custom_background = color
+
+        self.refresh_thumbnail(
+            item
+        )
+
+        self.update_selection_ui()
+
+    # ========================================================================
+    # Save all
+    # ========================================================================
+
+    def on_save_all(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        if not self.items:
+            return
+
+        dialog: Gtk.FileDialog = (
+            Gtk.FileDialog()
+        )
+
+        dialog.set_title(
+            "Choose Save Folder"
+        )
+
+        dialog.set_modal(True)
+
+        if self.current_folder is not None:
+            try:
+                dialog.set_initial_folder(
+                    Gio.File.new_for_path(
+                        str(self.current_folder)
+                    )
+                )
+            except Exception:
+                pass
+
+        dialog.select_folder(
+            self,
+            None,
+            self.on_save_folder_selected,
+        )
+
+    def on_save_folder_selected(
+        self,
+        dialog: Gtk.FileDialog,
+        result: Gio.AsyncResult,
+    ) -> None:
+        try:
+            folder: Gio.File | None = (
+                dialog.select_folder_finish(
+                    result
+                )
+            )
+        except GLib.Error:
+            return
+
+        if folder is None:
+            return
+
+        path: str | None = (
+            folder.get_path()
+        )
+
+        if path is None:
+            return
+
+        save_folder: Path = Path(path)
+
+        self.save_button.set_sensitive(
+            False
+        )
+
+        self.status_label.set_text(
+            "Saving images…"
+        )
+
+        worker: threading.Thread = (
+            threading.Thread(
+                target=self.save_images_worker,
+                args=(save_folder,),
+                daemon=True,
+            )
+        )
+
+        worker.start()
+
+    def save_images_worker(
+        self,
+        save_folder: Path,
+    ) -> None:
+        try:
+            save_folder.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            tile_width: int
+            tile_height: int
+
+            tile_width, tile_height = (
+                self.tile_size
+            )
+
+            aspect_ratio: float = (
+                tile_width / tile_height
+            )
+
+            saved: int = 0
+
+            errors: list[
+                tuple[str, str]
+            ] = []
+
+            for item in self.items:
+                try:
+                    output: Image.Image = (
+                        make_output_image(
+                            item.image,
+                            item.background,
+                            aspect_ratio,
+                            item.crop_ratio,
+                            item.size_mode,
+                        )
+                    )
+
+                    output_path: Path = (
+                        save_folder
+                        / f"{item.path.stem}.png"
+                    )
+
+                    # Don't overwrite the source image.
+                    if (
+                        output_path.resolve()
+                        == item.path.resolve()
+                    ):
+                        output_path = (
+                            save_folder
+                            / (
+                                f"{item.path.stem}"
+                                "_background.png"
+                            )
+                        )
+
+                    output.save(
+                        output_path,
+                        "PNG",
+                        optimize=True,
+                    )
+
+                    saved += 1
+
+                except Exception as exc:
+                    errors.append(
+                        (
+                            item.path.name,
+                            str(exc),
+                        )
+                    )
+
+            GLib.idle_add(
+                self.finish_saving,
+                saved,
+                errors,
+                save_folder,
+            )
+
+        except Exception as exc:
+            GLib.idle_add(
+                self.save_failed,
+                str(exc),
+            )
+
+    def finish_saving(
+        self,
+        saved: int,
+        errors: list[tuple[str, str]],
+        folder: Path,
+    ) -> bool:
+        self.save_button.set_sensitive(
+            bool(self.items)
+        )
+
+        if errors:
+            self.status_label.set_text(
+                f"Saved {saved} image(s) to "
+                f"{folder}; "
+                f"{len(errors)} failed."
+            )
+        else:
+            self.status_label.set_text(
+                f"Saved {saved} image(s) to "
+                f"{folder}."
+            )
+
+        return False
+
+    def save_failed(
+        self,
+        message: str,
+    ) -> bool:
+        self.save_button.set_sensitive(
+            bool(self.items)
+        )
+
+        self.status_label.set_text(
+            f"Save failed: {message}"
+        )
+
+        return False
+
+    # ========================================================================
+    # Cancel folder / exit
+    # ========================================================================
+
+    def on_cancel_folder(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        """
+        Discard the current folder and open folder selection again.
+        """
+        self.items.clear()
+
+        self.selected_item = None
+        self.current_folder = None
+
+        self.editor_mode = None
+
+        self.flowbox.remove_all()
+
+        self.folder_label.set_text(
+            "No folder selected"
+        )
+
+        self.status_label.set_text(
+            "Choose another image folder."
+        )
+
+        self.save_button.set_sensitive(
+            False
+        )
+
+        self.update_editor_visibility()
+        self.update_selection_ui()
+
+        self.open_folder_dialog()
+
+    def on_exit(
+        self,
+        _button: Gtk.Button,
+    ) -> None:
+        application: Gtk.Application | None = (
+            self.get_application()
+        )
+
+        if application is not None:
+            application.quit()
+
+    def on_close_request(
+        self,
+        _window: Gtk.Window,
+    ) -> bool:
+        self.executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
+        return False
+
+
+# ============================================================================
+# Application
+# ============================================================================
+
+class ImageBackgroundApplication(
+    Gtk.Application
+):
+    def __init__(self) -> None:
+        super().__init__(
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+        )
+
+    def do_activate(self) -> None:
+        window: Gtk.Window | None = (
+            self.get_active_window()
+        )
+
+        if window is None:
+            window = MainWindow(self)
+
+        window.present()
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+def main() -> int:
+    application: ImageBackgroundApplication = (
+        ImageBackgroundApplication()
+    )
+
+    return application.run(sys.argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
