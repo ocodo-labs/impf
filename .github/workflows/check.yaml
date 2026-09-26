@@ -24,50 +24,168 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euxo pipefail
+
+          echo "HOME=$HOME"
+          echo "PATH=$PATH"
+
           curl -LsSf https://astral.sh/uv/install.sh | sh
+
+          echo "After uv installer:"
+          find "$HOME" -maxdepth 4 -type f -name uv -print 2>/dev/null || true
+
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          echo "PATH=$PATH"
+          command -v uv
+          uv --version
 
       - name: Install uv on macOS
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          set -euxo pipefail
+
+          echo "HOME=$HOME"
+          echo "PATH=$PATH"
+
           curl -LsSf https://astral.sh/uv/install.sh | sh
+
+          echo "After uv installer:"
+          find "$HOME" -maxdepth 4 -type f -name uv -print 2>/dev/null || true
+
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          echo "PATH=$PATH"
+          command -v uv
+          uv --version
 
       - name: Install uv on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "USERPROFILE=$env:USERPROFILE"
+          Write-Host "PATH=$env:PATH"
+
           powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.local\bin"
+
+          Write-Host "After uv installer:"
+          Get-ChildItem -Path $env:USERPROFILE -Filter uv.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+
+          $UvPath = Join-Path $env:USERPROFILE ".local\bin"
+
+          Write-Host "Expected uv path: $UvPath"
+
+          if (-not (Test-Path $UvPath)) {
+            Write-Host "::error::uv bin directory does not exist: $UvPath"
+            Get-ChildItem -Path $env:USERPROFILE -Force
+            exit 1
+          }
+
+          Add-Content $env:GITHUB_PATH $UvPath
+          $env:PATH = "$UvPath;$env:PATH"
+
+          Write-Host "PATH=$env:PATH"
+          Get-Command uv
+          uv --version
 
       - name: Verify uv
         shell: bash
         run: |
+          set -euxo pipefail
+          echo "PATH=$PATH"
+          command -v uv
           uv --version
 
       - name: Install impf on Unix
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          set -euxo pipefail
+
+          echo "PWD=$PWD"
+          echo "PATH=$PATH"
+          echo "Current directory:"
+          pwd
+          ls -la
+
+          echo "Makefile:"
+          sed -n '1,240p' Makefile
+
+          echo "Running make install..."
           make install
+
+          echo "After installation:"
+          echo "PATH=$PATH"
+          find /usr/local/bin "$HOME/.local/bin" "$HOME/bin" \
+            -maxdepth 1 \
+            -name 'impf*' \
+            -print 2>/dev/null || true
 
       - name: Install impf on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./install.ps1
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "PWD=$PWD"
+          Write-Host "PATH=$env:PATH"
+
+          Write-Host "Current directory:"
+          Get-ChildItem -Force
+
+          Write-Host "install.ps1:"
+          Get-Content .\install.ps1
+
+          Write-Host "Running install.ps1..."
+          .\install.ps1
+
+          Write-Host "After installation:"
+          Write-Host "PATH=$env:PATH"
+
+          Write-Host "Searching for impf:"
+          Get-ChildItem `
+            -Path $env:USERPROFILE, $env:LOCALAPPDATA `
+            -Filter "impf*" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object FullName
 
       - name: Check impf is in PATH on Unix
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          set -euxo pipefail
+
+          echo "PATH=$PATH"
+
+          echo "command -v impf:"
           command -v impf
+
+          echo "Resolved executable:"
+          readlink -f "$(command -v impf)" 2>/dev/null || realpath "$(command -v impf)" || true
+
+          echo "impf --help:"
           impf --help
 
       - name: Check impf is in PATH on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "PATH=$env:PATH"
+
+          Write-Host "Get-Command impf:"
           Get-Command impf
+
+          Write-Host "Resolved command:"
+          (Get-Command impf).Source
+
+          Write-Host "impf --help:"
           impf --help
