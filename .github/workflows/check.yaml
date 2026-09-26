@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  check-install:
+  check-install-unix:
     strategy:
       matrix:
         os:
@@ -40,3 +40,38 @@ jobs:
             echo "❌ \`/usr/local/bin/impf\` is missing or not executable." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+
+  check-install-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+
+      - name: Verify uv
+        shell: pwsh
+        run: uv --version
+
+      - name: Install impf
+        shell: pwsh
+        run: ./install.ps1
+
+      - name: Check impf is installed
+        shell: pwsh
+        run: |
+          $scriptPath = Join-Path $env:LOCALAPPDATA "Programs\impf\impf.ps1"
+
+          Add-Content $env:GITHUB_STEP_SUMMARY "## impf install — $env:RUNNER_OS"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+
+          if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "✅ ``$scriptPath`` is installed."
+          } else {
+            Add-Content $env:GITHUB_STEP_SUMMARY "❌ ``$scriptPath`` is missing."
+            exit 1
+          }
