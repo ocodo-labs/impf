@@ -19,29 +19,24 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install uv
-        shell: bash
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Verify uv
-        shell: bash
         run: uv --version
 
       - name: Install impf
-        shell: bash
         run: make install
 
       - name: Check impf is installed
-        shell: bash
         run: |
+          echo "## impf install — $RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
           if [[ -x /usr/local/bin/impf ]]; then
-            echo "## impf install — $RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
             echo "✅ \`/usr/local/bin/impf\` is installed and executable." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## impf install — $RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
             echo "❌ \`/usr/local/bin/impf\` is missing or not executable." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
